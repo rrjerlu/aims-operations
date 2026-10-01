@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 import io
+import hashlib
+import hmac
+import re
 from datetime import date, timedelta
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -49,7 +52,6 @@ def apply_aims_style() -> None:
     )
 
 
-@st.cache_resource
 def get_store() -> Store:
     try:
         database_url = st.secrets.get("AIMS_DATABASE_URL", None)
@@ -66,6 +68,21 @@ def secret_value(name: str, default: str = "") -> str:
     except StreamlitSecretNotFoundError:
         return default
     return str(value or default)
+
+
+def hash_password(password: str, salt: bytes | None = None) -> str:
+    salt = salt or os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 240_000)
+    return f"{salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        salt_hex, digest_hex = encoded.split("$", 1)
+        expected = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), 240_000).hex()
+        return hmac.compare_digest(expected, digest_hex)
+    except (ValueError, TypeError):
+        return False
 
 
 def oidc_enabled() -> bool:
@@ -126,17 +143,42 @@ def render_login() -> bool:
                 if st.button("使用 Google 登入", type="primary", width="stretch"):
                     st.login()
             else:
-                account = st.text_input("登入帳號", placeholder="統一編號或門市代號，例如 store001")
-                password = st.text_input("安全密碼", type="password", placeholder="請輸入管理密碼")
-                if st.button("進入 AIMS 決策工作台", type="primary", width="stretch"):
-                    if account.strip() and password:
-                        st.session_state["authenticated"] = True
-                        st.session_state["account"] = account.strip()
-                        st.session_state["role"] = "manager"
-                        st.session_state["auth_provider"] = "local_demo"
-                        record_audit("登入", "本機測試登入")
-                        st.rerun()
-                    st.error("請輸入帳號與密碼。")
+                login_tab, apply_tab = st.tabs(["企業帳密登入", "申請企業帳號"])
+                with login_tab:
+                    account = st.text_input("登入帳號", placeholder="公司信箱或門市代號", key="login_account")
+                    password = st.text_input("安全密碼", type="password", placeholder="請輸入密碼", key="login_password")
+                    if st.button("進入 AIMS 決策工作台", type="primary", width="stretch"):
+                        user = get_store().authenticate_user(account.strip().lower()) if account.strip() else None
+                        if user and verify_password(password, user["password_hash"]):
+                            st.session_state["authenticated"] = True
+                            st.session_state["account"] = user["account"]
+                            st.session_state["display_name"] = user["company_name"]
+                            st.session_state["role"] = user["role"]
+                            st.session_state["auth_provider"] = "enterprise_password"
+                            record_audit("企業登入", user["company_name"])
+                            st.rerun()
+                        else:
+                            st.error("帳號或密碼不正確。請先申請企業帳號，或確認輸入內容。")
+                with apply_tab:
+                    company = st.text_input("企業／門市名稱", placeholder="例如：安心美容有限公司", key="apply_company")
+                    account = st.text_input("申請登入帳號", placeholder="建議使用公司信箱", key="apply_account")
+                    password = st.text_input("設定登入密碼", type="password", placeholder="至少 8 個字元", key="apply_password")
+                    confirm = st.text_input("再次輸入密碼", type="password", key="apply_confirm")
+                    if st.button("送出企業申請", type="primary", width="stretch"):
+                        normalized = account.strip().lower()
+                        if not company.strip() or not normalized or not password:
+                            st.error("請完整填寫企業名稱、帳號與密碼。")
+                        elif not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$|^[a-z0-9][a-z0-9._-]{2,30}$", normalized):
+                            st.error("帳號請使用公司 Email 或英數字門市代號。")
+                        elif len(password) < 8 or password != confirm:
+                            st.error("密碼至少 8 個字元，且兩次輸入必須一致。")
+                        else:
+                            try:
+                                get_store().create_user(company.strip(), normalized, hash_password(password))
+                                record_audit("企業申請", f"{company.strip()} · {normalized}")
+                                st.success("企業帳號已建立，現在可切換到「企業帳密登入」使用。")
+                            except ValueError as exc:
+                                st.error(str(exc))
             if st.button("免註冊・一鍵體驗示範帳號", width="stretch"):
                 st.session_state["authenticated"] = True
                 st.session_state["account"] = "store001"
@@ -153,7 +195,7 @@ def render_login() -> bool:
                 st.caption(f"企業登入已設定：{oidc_provider}")
                 if st.button(f"使用 {oidc_provider} 登入", width="stretch"):
                     st.login()
-            st.caption("示範模式只使用本機記憶體資料，重新整理後可重新開始。")
+            st.caption("企業帳號會寫入目前設定的 PostgreSQL／Supabase；未設定時使用本機 SQLite。示範帳號僅供體驗。")
     return bool(st.session_state.get("authenticated", False))
 
 
@@ -515,7 +557,7 @@ def render_sidebar() -> str:
                 st.logout()
             st.session_state["authenticated"] = False
             st.rerun()
-        st.caption("AIMS prototype · v0.2")
+        st.caption("AIMS prototype · v0.4 · interactive workflow")
     return page
 
 
@@ -549,7 +591,10 @@ def render_overview(operations: pd.DataFrame) -> None:
         with st.container(border=True):
             st.subheader("營收趨勢")
             trend = operations.groupby("日期", as_index=False)["營收"].sum()
-            st.area_chart(trend, x="日期", y="營收")
+            st.area_chart(trend.set_index("日期"), y="營收", height=230)
+            booking_trend = operations.groupby("日期", as_index=False)["預約數"].sum()
+            st.caption("預約量趨勢")
+            st.line_chart(booking_trend.set_index("日期"), y="預約數", height=150)
     with col2:
         with st.container(border=True):
             st.subheader("門市營運健康度")
@@ -568,6 +613,8 @@ def render_overview(operations: pd.DataFrame) -> None:
                     "營收": st.column_config.NumberColumn("營收", format="$%d"),
                 },
             )
+            st.caption("健康度比較")
+            st.bar_chart(health.set_index("門市")[["健康度"]], y="健康度", height=180)
 
     with st.container(border=True):
         st.subheader("🧭 POLC 現代管理實務推進路線")
@@ -668,6 +715,13 @@ def render_schedule(shifts: pd.DataFrame) -> None:
         st.metric("疑似重複班次", f"{len(duplicates)}", border=True)
     with st.container(border=True):
         st.subheader("排班覆蓋與風險")
+        coverage_chart = coverage.groupby("日期", as_index=False).agg(
+            已覆蓋=("覆蓋狀態", lambda values: int((values == "已覆蓋").sum())),
+            需處理=("覆蓋狀態", lambda values: int((values == "需處理").sum())),
+        )
+        if not coverage_chart.empty:
+            st.caption("每日門市覆蓋狀態")
+            st.bar_chart(coverage_chart.set_index("日期"), y=["已覆蓋", "需處理"], height=190)
         st.dataframe(
             coverage,
             hide_index=True,
@@ -712,17 +766,31 @@ def render_module_page(page: str) -> None:
     render_header(title, subtitle)
     complaints = st.session_state.get("demo_complaints", sample_complaints())
     if page == "2. 接觸點與工位斷點 (Organize)":
-        step = st.selectbox(
-            "Organize 子流程",
-            [
-                "2-1 營運紀錄與標準定義",
-                "2-2 尖峰等候與人手測算",
-                "2-3 接觸點泳道流程圖",
-                "2-4 80/20 卡關真因排查",
-                "2-5 敏捷對策防呆檢驗",
-                "2-6 改善公文報告生成",
-            ],
-        )
+        steps = [
+            "2-1 營運紀錄與標準定義",
+            "2-2 尖峰等候與人手測算",
+            "2-3 接觸點泳道流程圖",
+            "2-4 80/20 卡關真因排查",
+            "2-5 敏捷對策防呆檢驗",
+            "2-6 改善公文報告生成",
+        ]
+        if "organize_step" not in st.session_state:
+            st.session_state["organize_step"] = steps[0]
+        st.subheader("Organize 子流程")
+        st.caption("依序完成 2-1 到 2-6；每一步都可直接點選，不會被隱藏在其他頁面。")
+        step_columns = st.columns(6)
+        for index, step_name in enumerate(steps):
+            with step_columns[index]:
+                if st.button(
+                    step_name.split(" ", 1)[0],
+                    key=f"organize_step_button_{index}",
+                    type="primary" if st.session_state["organize_step"] == step_name else "secondary",
+                    width="stretch",
+                ):
+                    st.session_state["organize_step"] = step_name
+                    st.rerun()
+        step = st.session_state["organize_step"]
+        st.info(f"目前步驟：{step}")
         if step == "2-1 營運紀錄與標準定義":
             st.subheader("營運紀錄與標準定義")
             st.caption("先提供現場紀錄，再由主管定義尖峰區間與可接受服務標準。")
@@ -745,6 +813,9 @@ def render_module_page(page: str) -> None:
                 }
                 record_audit("建立營運標準", f"等待標準 {service_target} 分鐘")
                 st.success("標準已建立，可進入 2-2 進行尖峰人手測算。")
+            if "operations_definition" in st.session_state:
+                definition = st.session_state["operations_definition"]
+                st.success(f"標準狀態：已建立（等待標準 {definition['等待標準']} 分鐘，尖峰 {definition['尖峰']}）。")
         elif step == "2-2 尖峰等候與人手測算":
             st.subheader("尖峰等候與人手測算")
             data = pd.DataFrame(
@@ -760,11 +831,25 @@ def render_module_page(page: str) -> None:
             target = st.number_input("目標等待分鐘", min_value=1, value=15)
             row = data[data["時段"] == selected].iloc[0]
             gap = max(0, int(row["平均等待分鐘"] - target))
-            st.metric("預估等待超標", f"{gap} 分鐘", border=True)
+            metric_a, metric_b = st.columns(2)
+            with metric_a:
+                st.metric("預估等待超標", f"{gap} 分鐘", border=True)
+            with metric_b:
+                st.metric("人力缺口估計", f"{max(0, round(row['到店人數'] / 20))} 人" if gap else "0 人", border=True)
+            st.caption("尖峰時段到店量與平均等待")
+            st.bar_chart(data.set_index("時段")[["到店人數", "平均等待分鐘"]], height=220)
             if st.button("產生人手調度建議", type="primary", icon=":material/groups:"):
                 extra = max(1, round(row["到店人數"] / 20)) if gap else 0
+                st.session_state["staffing_recommendation"] = {
+                    "時段": selected,
+                    "缺口": gap,
+                    "支援人員": extra,
+                }
                 st.success(f"{selected} 建議增加 {extra} 名支援人員，並將櫃檯與交接工位設為優先。")
                 record_audit("完成尖峰人手測算", f"{selected} · 缺口 {extra} 人")
+            if "staffing_recommendation" in st.session_state:
+                result = st.session_state["staffing_recommendation"]
+                st.success(f"測算結果：{result['時段']}，等待超標 {result['缺口']} 分鐘，建議增加 {result['支援人員']} 名支援人員。")
         elif step == "2-3 接觸點泳道流程圖":
             st.subheader("接觸點泳道流程圖")
             flow = pd.DataFrame(
@@ -776,6 +861,21 @@ def render_module_page(page: str) -> None:
                     "輸出": ["確認通知", "報到狀態", "服務單", "成果", "結案通知"],
                 }
             )
+            st.caption("由左至右為顧客旅程；每張卡片標示該接觸點的責任角色與交付物。")
+            for _, item in flow.iterrows():
+                with st.container(border=True):
+                    step_col, point_col, role_col, output_col = st.columns([0.5, 1.5, 1.2, 1.5])
+                    with step_col:
+                        st.markdown(f"### {int(item['順序'])}")
+                    with point_col:
+                        st.markdown(f"**{item['接觸點']}**")
+                        st.caption(f"輸入：{item['輸入']}")
+                    with role_col:
+                        st.markdown("責任角色")
+                        st.caption(item["責任角色"])
+                    with output_col:
+                        st.markdown("交付輸出")
+                        st.caption(item["輸出"])
             st.dataframe(flow, hide_index=True)
             st.caption("可將每個接觸點匯出後交給各工位主管確認責任邊界。")
             st.download_button("下載泳道流程 CSV", flow.to_csv(index=False).encode("utf-8-sig"), "aims_swimlane.csv", "text/csv")
@@ -789,11 +889,18 @@ def render_module_page(page: str) -> None:
                 }
             )
             causes["累積比例"] = causes["案件數"].cumsum() / causes["案件數"].sum() * 100
-            st.dataframe(causes, hide_index=True)
-            st.bar_chart(causes, x="真因", y="案件數")
+            chart_col, table_col = st.columns([1.2, 1])
+            with chart_col:
+                st.caption("案件數與累積比例")
+                st.bar_chart(causes.set_index("真因")[["案件數"]], y="案件數", height=220)
+                st.line_chart(causes.set_index("真因")[["累積比例"]], y="累積比例", height=180)
+            with table_col:
+                st.dataframe(causes, hide_index=True)
             if st.button("鎖定前 20% 真因", type="primary", icon=":material/filter_alt:"):
                 st.session_state["top_causes"] = causes.head(2)
                 st.success("已鎖定：交接欄位不完整、尖峰未分流。可進入 2-5 建立敏捷對策。")
+            if "top_causes" in st.session_state:
+                st.dataframe(st.session_state["top_causes"], hide_index=True)
         elif step == "2-5 敏捷對策防呆檢驗":
             st.subheader("敏捷對策防呆檢驗")
             countermeasures = pd.DataFrame(
@@ -806,8 +913,11 @@ def render_module_page(page: str) -> None:
             )
             edited = st.data_editor(countermeasures, hide_index=True, key="organize_countermeasures")
             if st.button("確認對策可行性", type="primary", icon=":material/task_alt:"):
+                st.session_state["countermeasures_confirmed"] = True
                 record_audit("確認敏捷對策", f"{len(edited)} 項")
                 st.success("對策已確認，下一步可生成改善公文。")
+            if st.session_state.get("countermeasures_confirmed"):
+                st.success("對策狀態：已確認，可進入 2-6。")
         else:
             st.subheader("改善公文報告生成")
             report = pd.DataFrame(
@@ -825,12 +935,16 @@ def render_module_page(page: str) -> None:
             )
             st.dataframe(report, hide_index=True)
             if st.button("建立改善公文", type="primary", icon=":material/article:"):
+                st.session_state["organize_report"] = report
                 record_audit("建立改善公文", "Organize 2-6")
                 st.success("改善公文已建立，並寫入 POLC 審計台帳。")
-                st.download_button("下載改善公文 CSV", report.to_csv(index=False).encode("utf-8-sig"), "aims_improvement_report.csv", "text/csv")
-                sections = [(row["段落"], row["內容"]) for _, row in report.iterrows()]
-                st.download_button("下載改善公文 DOCX", export_docx("AIMS 改善公文", sections), "aims_improvement_report.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-                st.download_button("下載改善公文 PDF", export_pdf("AIMS 改善公文", sections), "aims_improvement_report.pdf", "application/pdf")
+            generated_report = st.session_state.get("organize_report")
+            if isinstance(generated_report, pd.DataFrame):
+                st.success("改善公文狀態：已建立，可下載。")
+                sections = [(row["段落"], row["內容"]) for _, row in generated_report.iterrows()]
+                st.download_button("下載改善公文 CSV", generated_report.to_csv(index=False).encode("utf-8-sig"), "aims_improvement_report.csv", "text/csv", key="download_organize_csv")
+                st.download_button("下載改善公文 DOCX", export_docx("AIMS 改善公文", sections), "aims_improvement_report.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="download_organize_docx")
+                st.download_button("下載改善公文 PDF", export_pdf("AIMS 改善公文", sections), "aims_improvement_report.pdf", "application/pdf", key="download_organize_pdf")
         return
     if page == "資料清洗與格式檢核":
         st.subheader("資料健康檢查")
@@ -856,6 +970,13 @@ def render_module_page(page: str) -> None:
         if "analysis_result" in st.session_state:
             st.success("分析完成：已抽取客觀事實並標記 4M1E 主因。")
             st.dataframe(st.session_state["analysis_result"], hide_index=True)
+            st.download_button(
+                "下載 4M1E 分析結果",
+                st.session_state["analysis_result"].to_csv(index=False).encode("utf-8-sig"),
+                "aims_4m1e_analysis.csv",
+                "text/csv",
+                key="download_4m1e",
+            )
     elif page == "2. 接觸點與工位斷點 (Organize)":
         st.subheader("P90 泳道斷點快篩")
         process = pd.DataFrame(
@@ -874,6 +995,12 @@ def render_module_page(page: str) -> None:
                     st.subheader(title_text)
                     st.checkbox(detail, key=f"playbook_{title_text}")
         st.text_area("主管口頭指令", value="今天先確保預約交接雙簽，超過 15 分鐘主動告知顧客。")
+        if st.button("產生今日作戰卡", type="primary", icon=":material/assignment:"):
+            st.session_state["lead_playbook_created"] = True
+            record_audit("產生幹部作戰卡", "Lead")
+            st.success("今日作戰卡已產生，可依三個時段逐項確認。")
+        if st.session_state.get("lead_playbook_created"):
+            st.success("作戰卡狀態：已產生，可依三個時段逐項確認。")
     elif page == "4. 接觸點防呆雙簽 (Control)":
         st.subheader("防呆雙簽驗收")
         checks = pd.DataFrame(
@@ -881,8 +1008,15 @@ def render_module_page(page: str) -> None:
         )
         edited = st.data_editor(checks, hide_index=True, key="control_checks")
         if st.button("發布防呆驗收結果", type="primary", icon=":material/verified:"):
+            st.session_state["control_result"] = {
+                "completed": int((edited["狀態"] == "已完成").sum()),
+                "total": len(edited),
+            }
             record_audit("發布防呆驗收", f"{int((edited['狀態'] == '已完成').sum())}/{len(edited)} 項完成")
             st.success("驗收結果已寫入審計台帳。")
+        if "control_result" in st.session_state:
+            result = st.session_state["control_result"]
+            st.success(f"驗收狀態：已發布（{result['completed']}/{result['total']} 項完成）。")
     elif page == "POLC 終極全景改善白皮書":
         st.subheader("改善白皮書預覽")
         report = pd.DataFrame(
@@ -890,10 +1024,15 @@ def render_module_page(page: str) -> None:
         )
         st.dataframe(report, hide_index=True)
         if st.button("產生改善白皮書 CSV", type="primary", icon=":material/article:"):
-            sections = [(row["階段"], f"{row['主要發現']}；成果指標：{row['成果指標']}") for _, row in report.iterrows()]
-            st.download_button("下載白皮書 CSV", report.to_csv(index=False).encode("utf-8-sig"), "aims_polc_report.csv", "text/csv")
-            st.download_button("下載白皮書 DOCX", export_docx("AIMS POLC 改善白皮書", sections), "aims_polc_report.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            st.download_button("下載白皮書 PDF", export_pdf("AIMS POLC 改善白皮書", sections), "aims_polc_report.pdf", "application/pdf")
+            st.session_state["polc_report"] = report
+            record_audit("產生 POLC 白皮書", "Plan / Organize / Lead / Control")
+        generated_report = st.session_state.get("polc_report")
+        if isinstance(generated_report, pd.DataFrame):
+            st.success("白皮書狀態：已產生，可下載。")
+            sections = [(row["階段"], f"{row['主要發現']}；成果指標：{row['成果指標']}") for _, row in generated_report.iterrows()]
+            st.download_button("下載白皮書 CSV", generated_report.to_csv(index=False).encode("utf-8-sig"), "aims_polc_report.csv", "text/csv", key="download_polc_csv")
+            st.download_button("下載白皮書 DOCX", export_docx("AIMS POLC 改善白皮書", sections), "aims_polc_report.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="download_polc_docx")
+            st.download_button("下載白皮書 PDF", export_pdf("AIMS POLC 改善白皮書", sections), "aims_polc_report.pdf", "application/pdf", key="download_polc_pdf")
     with st.container(border=True):
         st.subheader("目前工作區")
         st.info("以上為可操作的模擬案例。匯入實際資料後，這些表格與分析會改用你的資料。")

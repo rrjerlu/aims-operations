@@ -23,6 +23,7 @@ streamlit run app.py
 - Organize 公文與 POLC 白皮書可匯出 CSV、DOCX、PDF。
 - PostgreSQL／Supabase 儲存適配器，未設定連線時使用本機 SQLite。
 - OIDC 登入掛接點（Google／Microsoft 由 `.streamlit/secrets.toml` 設定）。
+- 企業申請與帳密登入：申請資料會寫入 PostgreSQL／Supabase；未設定時使用本機 SQLite。
 - 通知佇列與同步工作佇列，可交給部署平台的 cron／worker 執行。
 - Email、LINE、Teams 與 Shiftwise API provider adapter，預設為 dry-run。
 - Docker 啟動設定與環境變數範本。
@@ -50,6 +51,17 @@ streamlit run app.py
 7. 可用 `AIMS_ADMIN_EMAILS` 與 `AIMS_AUDITOR_EMAILS` 指定角色，其餘已登入帳號預設為 manager。
 
 啟用 `[auth]` 後，系統會停用本機帳密登入，只保留 Google OIDC 與示範帳號入口；所有真正資料操作仍會寫入 PostgreSQL 審計表。
+
+### 企業申請與帳密登入
+
+未設定 OIDC 時，登入頁提供「申請企業帳號」：
+
+1. 填寫企業／門市名稱、登入帳號與至少 8 個字元的密碼。
+2. 送出後即可使用「企業帳密登入」。
+3. 密碼以 PBKDF2-SHA256 雜湊保存，不會寫入明文。
+4. 正式環境請設定 `AIMS_DATABASE_URL`，讓帳號跨部署重啟持久保存；未設定時帳號只存在本機 SQLite。
+
+若啟用 `[auth]` 的 Google OIDC，正式環境會優先使用企業單一登入；企業帳密申請入口則保留給未啟用 OIDC 的模式。
 
 ### 背景工作
 

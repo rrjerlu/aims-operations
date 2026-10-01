@@ -58,6 +58,15 @@ CREATE TABLE IF NOT EXISTS memberships (
     created_at TEXT NOT NULL,
     UNIQUE (tenant_id, email)
 );
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_name TEXT NOT NULL,
+    account TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'manager',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL
+);
 """
 
 POSTGRES_SCHEMA = SCHEMA.replace(
@@ -125,6 +134,44 @@ class Store:
                     "INSERT INTO audit_events (created_at,account,action,detail) VALUES (?,?,?,?)",
                     (_now(), account, action, detail),
                 )
+
+    def create_user(self, company_name: str, account: str, password_hash: str) -> None:
+        values = (company_name, account, password_hash, _now())
+        with self.connection() as connection:
+            try:
+                if self.backend == "postgresql":
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            "INSERT INTO users (company_name,account,password_hash,created_at) VALUES (%s,%s,%s,%s)",
+                            values,
+                        )
+                else:
+                    connection.execute(
+                        "INSERT INTO users (company_name,account,password_hash,created_at) VALUES (?,?,?,?)",
+                        values,
+                    )
+            except Exception as exc:
+                if "unique" in str(exc).lower():
+                    raise ValueError("此登入帳號已申請，請直接登入或改用其他帳號。") from exc
+                raise
+
+    def authenticate_user(self, account: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            if self.backend == "postgresql":
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT company_name,account,password_hash,role,status FROM users WHERE account=%s",
+                        (account,),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        return None
+                    return dict(zip(("company_name", "account", "password_hash", "role", "status"), row))
+            row = connection.execute(
+                "SELECT company_name,account,password_hash,role,status FROM users WHERE account=?",
+                (account,),
+            ).fetchone()
+            return dict(row) if row else None
 
     def add_job(self, source: str, payload: dict[str, Any]) -> int:
         with self.connection() as connection:
